@@ -19,6 +19,7 @@
     "typescript": "^5.7.2"
   },
   "dependencies": {
+    "axios": "^1.11.0",
     "dockerode": "^4.0.2",
     "stream-chain": "^3.3.2",
     "stream-json": "^1.9.1",

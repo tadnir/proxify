@@ -1,6 +1,9 @@
 import Docker from "dockerode"
 import { getEventStream } from "./docker-events"
 import { logger } from "./logger"
+import { createProxyHost } from "./nginx-proxy.js";
+
+
 
 function getDnsName(container: Docker.ContainerInfo) {
   const service = container.Labels["com.docker.compose.service"]
@@ -8,10 +11,29 @@ function getDnsName(container: Docker.ContainerInfo) {
   return `${service}.${project}.svc.cluster.local`
 }
 
+function getAppName(container: Docker.ContainerInfo) {
+  const label = container.Labels["com.docker.compose.project"]; // e.g. "ix-radarr"
+  const name = label.replace(/^ix-/, ""); // → "radarr"
+  return name;
+}
+
+
 function prohibitedNetworkMode(networkMode: string) {
   return [ "none", "host" ].includes(networkMode) ||
     networkMode.startsWith("container:") ||
     networkMode.startsWith("service:")
+}
+
+async function setupProxy(container: Docker.ContainerInfo) {
+  await createProxyHost({
+    npmUrl: `http://npm.ix-${process.env.NPM_APP_NAME}.svc.cluster.local:${process.env.NPM_APP_PORT}`,
+    domainName: `${getAppName(container)}.${process.env.DOMAIN_NAME || "example.com"}`,
+    scheme: "http",
+    forwardHost: getDnsName(container),
+    port: 80,
+    certificateId: 1,
+    apiKey: process.env.NPM_API_KEY || ""
+  });
 }
 
 async function connectContainerToAppsNetwork(docker: Docker, container: Docker.ContainerInfo) {
@@ -21,6 +43,8 @@ async function connectContainerToAppsNetwork(docker: Docker, container: Docker.C
   }
 
   const dnsName = getDnsName(container)
+
+  setupProxy(container);
 
   logger.info(`Container ${container.Id} (aka ${container.Names.join(", ")}) proxy ${dnsName}`)
 }
