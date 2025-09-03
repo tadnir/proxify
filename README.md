@@ -23,6 +23,7 @@ services:
       DOMAIN_NAME: example.com # apps will be available at <app-name>.example.com
       NPM_API_KEY: npmapikey # put npm admin key
       NPM_APP_PORT: 81 # port for npm web ui
+      APP_BLACKLIST: "nginxproxy,dragonify,proxify" # List of apps that won't be configured to npm
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
 ```
