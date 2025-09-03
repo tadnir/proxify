@@ -54,7 +54,7 @@ async function connectContainerToAppsNetwork(docker: Docker, container: Docker.C
     scheme: "http",
     forwardHost: dnsName,
     port: 80,
-    certificateId: 1,
+    certificateId: Number(process.env.CERT_ID) || 0,
     apiKey: process.env.NPM_API_KEY || ""
   });
 

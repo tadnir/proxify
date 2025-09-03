@@ -24,6 +24,7 @@ services:
       NPM_API_KEY: npmapikey # put npm admin key
       NPM_APP_PORT: 81 # port for npm web ui
       APP_BLACKLIST: "nginxproxy,dragonify,proxify" # List of apps that won't be configured to npm
+      CERT_ID: 1 # The Id of the certificate to set of the proxies (id can be seen in web ui)
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
 ```
