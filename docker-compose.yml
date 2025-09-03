@@ -1,6 +1,6 @@
 services:
-  dragonify:
-    image: ghcr.io/tjhorner/dragonify:main
+  proxify:
+    image: ghcr.io/tadnir/proxify:main
     restart: always
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock

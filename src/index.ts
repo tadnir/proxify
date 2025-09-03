@@ -2,26 +2,6 @@ import Docker from "dockerode"
 import { getEventStream } from "./docker-events"
 import { logger } from "./logger"
 
-const NETWORK_NAME = "apps-internal"
-
-async function setUpNetwork(docker: Docker) {
-  logger.info(`Setting up network ${NETWORK_NAME}`)
-
-  const existingNetworks = await docker.listNetworks({filters: {name: [NETWORK_NAME]}})
-  if (existingNetworks.length === 1) {
-    logger.info("Network already exists")
-    return
-  }
-
-  await docker.createNetwork({
-    Name: NETWORK_NAME,
-    Driver: "bridge",
-    Internal: true,
-  })
-
-  logger.info("Network created")
-}
-
 function getDnsName(container: Docker.ContainerInfo) {
   const service = container.Labels["com.docker.compose.service"]
   const project = container.Labels["com.docker.compose.project"]
@@ -40,28 +20,9 @@ async function connectContainerToAppsNetwork(docker: Docker, container: Docker.C
     return
   }
 
-  const network = docker.getNetwork(NETWORK_NAME)
   const dnsName = getDnsName(container)
 
-  logger.debug(`Connecting container ${container.Id} to network as ${dnsName}`)
-
-  try {
-    await network.connect({
-      Container: container.Id,
-      EndpointConfig: {
-        Aliases: [ dnsName ]
-      }
-    })
-  } catch (e: any) {
-    logger.error(`Failed to connect container ${container.Id} to network:`, e)
-    return
-  }
-
-  logger.info(`Container ${container.Id} (aka ${container.Names.join(", ")}) connected to network as ${dnsName}`)
-}
-
-function isContainerInNetwork(container: Docker.ContainerInfo) {
-  return container.NetworkSettings.Networks[NETWORK_NAME] !== undefined
+  logger.info(`Container ${container.Id} (aka ${container.Names.join(", ")}) proxy ${dnsName}`)
 }
 
 function isIxProjectName(name: string) {
@@ -84,10 +45,10 @@ async function connectAllContainersToAppsNetwork(docker: Docker) {
 
   const appContainers = containers.filter(isIxAppContainer)
   for (const container of appContainers) {
-    if (isContainerInNetwork(container)) {
-      logger.debug(`Container ${container.Id} already connected to network`)
-      continue
-    }
+    // if (isContainerInNetwork(container)) {
+    //   logger.debug(`Container ${container.Id} already connected to network`)
+    //   continue
+    // }
 
     await connectContainerToAppsNetwork(docker, container)
   }
@@ -107,10 +68,10 @@ async function connectNewContainerToAppsNetwork(docker: Docker, containerId: str
     return
   }
 
-  if (isContainerInNetwork(container)) {
-    logger.debug(`Container ${container.Id} already connected to network`)
-    return
-  }
+  // if (isContainerInNetwork(container)) {
+  //   logger.debug(`Container ${container.Id} already connected to network`)
+  //   return
+  // }
 
   logger.debug(`New container started: ${container.Id}`)
   await connectContainerToAppsNetwork(docker, container)
@@ -119,7 +80,6 @@ async function connectNewContainerToAppsNetwork(docker: Docker, containerId: str
 async function main() {
   const docker = new Docker()
 
-  await setUpNetwork(docker)
   await connectAllContainersToAppsNetwork(docker)
 
   const events = getEventStream(docker)
