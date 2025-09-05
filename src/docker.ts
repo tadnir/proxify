@@ -44,6 +44,16 @@ export function prohibitedNetworkMode(container: Docker.ContainerInfo) {
       container.HostConfig.NetworkMode.startsWith("service:")
 }
 
+export function hasOpenPort(container: Docker.ContainerInfo, port: number): boolean {
+  if (!container.Ports) return false;
+  return container.Ports.some(portInfo => portInfo.PrivatePort === port);
+}
+
+export function getOpenPorts(container: Docker.ContainerInfo): number[] {
+  if (!container.Ports) return [];
+  return container.Ports.map(portInfo => portInfo.PrivatePort);
+}
+
 export async function listApps(docker: Docker): Promise<string[]> {
   const allContainers = await docker.listContainers({
     limit: -1,

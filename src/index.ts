@@ -1,5 +1,5 @@
 import Docker from "dockerode"
-import { getEventStream, getDnsName, getAppName, isIxAppContainer, prohibitedNetworkMode, listApps } from "./docker"
+import { getEventStream, getDnsName, getAppName, isIxAppContainer, prohibitedNetworkMode, listApps, hasOpenPort, getOpenPorts } from "./docker"
 import { logger } from "./logger"
 import { NPMServer } from "./npm";
 
@@ -70,12 +70,13 @@ function stopTokenRefresh(): void {
 
 async function proxyApp(docker: Docker, appName: string) {
   // Get all containers for this app
-  const appContainers = await docker.listContainers({
+  let appContainers = await docker.listContainers({
     limit: -1,
     filters: {
       label: [ "com.docker.compose.project" ]
     }
-  }).filter(container => {
+  })
+  appContainers = appContainers.filter(container => {
     if (!isIxAppContainer(container)) return false;
     if (getAppName(container) !== appName) return false;
     if (prohibitedNetworkMode(container)) {
@@ -90,17 +91,51 @@ async function proxyApp(docker: Docker, appName: string) {
     return;
   }
 
-  // Pick the first valid container
-  const selectedContainer = appContainers[0];
+  // Filter containers with open ports
+  const containersWithPorts = appContainers.filter(container => {
+    const openPorts = getOpenPorts(container);
+    return openPorts.length > 0;
+  });
+
+  if (containersWithPorts.length === 0) {
+    logger.debug(`No containers with open ports found for app ${appName}`);
+    return;
+  }
+
+  // Select container based on port priority: 443 (HTTPS) > 80 (HTTP) > first available
+  let selectedContainer: Docker.ContainerInfo;
+  let scheme: string;
+  let port: number;
+
+  const httpsContainer = containersWithPorts.find(container => hasOpenPort(container, 443));
+  const httpContainer = containersWithPorts.find(container => hasOpenPort(container, 80));
+
+  if (httpsContainer) {
+    selectedContainer = httpsContainer;
+    scheme = "https";
+    port = 443;
+    logger.debug(`App ${appName}: Using HTTPS container ${selectedContainer.Id} with port 443`);
+  } else if (httpContainer) {
+    selectedContainer = httpContainer;
+    scheme = "http";
+    port = 80;
+    logger.debug(`App ${appName}: Using HTTP container ${selectedContainer.Id} with port 80`);
+  } else {
+    selectedContainer = containersWithPorts[0];
+    scheme = "http";
+    port = getOpenPorts(selectedContainer)[0];
+    logger.debug(`App ${appName}: Using first available container ${selectedContainer.Id} with port ${port}`);
+  }
+
   const dnsName = getDnsName(selectedContainer);
-  logger.debug(`App ${appName} has ${appContainers.length} valid containers, proxfing: ${selectedContainer.Id}`);
+  logger.debug(`App ${appName} has ${containersWithPorts.length} containers with open ports, proxying: ${selectedContainer.Id}`);
 
   try {
     await npmServer.createProxyHost({
       domainName: `${appName}.${process.env.DOMAIN_NAME || "example.com"}`,
-      scheme: "http",
+      scheme: scheme,
       forwardHost: dnsName,
-      port: 80,
+      port: port,
       certificateId: Number(process.env.NPM_CERT_ID) || 0
     });
 
