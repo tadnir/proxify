@@ -43,3 +43,21 @@ export function prohibitedNetworkMode(container: Docker.ContainerInfo) {
       container.HostConfig.NetworkMode.startsWith("container:") ||
       container.HostConfig.NetworkMode.startsWith("service:")
 }
+
+export async function listApps(docker: Docker): Promise<string[]> {
+  const allContainers = await docker.listContainers({
+    limit: -1,
+    filters: {
+      label: [ "com.docker.compose.project" ]
+    }
+  });
+
+  const appNames = new Set<string>();
+  for (const container of allContainers) {
+    if (isIxAppContainer(container)) {
+      appNames.add(getAppName(container));
+    }
+  }
+
+  return Array.from(appNames);
+}

@@ -155,13 +155,12 @@ async function main() {
         logger.debug(`Application ${appName} is blacklisted, skipping`);
         return;
       }
-
-      logger.info(`Proxying application ${appName}`);
       
       // Wait a bit for all containers of the app to start
       logger.debug(`Waiting 5 seconds for all containers of app ${appName} to start`);
       await new Promise(resolve => setTimeout(resolve, 5000));
-      
+
+      logger.info(`Proxying application ${appName}`);
       await proxyApp(docker, appName)
     })
     
