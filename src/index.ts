@@ -103,7 +103,7 @@ async function connectContainerToAppsNetwork(docker: Docker, container: Docker.C
   const dnsName = getDnsName(container);
   const appName = getAppName(container);
   if (BLACKLIST.includes(appName)) {
-    logger.debug(`Application ${BLACKLIST} is blacklisted, skipping`);
+    logger.debug(`Application ${appName} is blacklisted, skipping`);
     return;
   }
 
