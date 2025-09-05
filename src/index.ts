@@ -1,7 +1,7 @@
 import Docker from "dockerode"
-import { getEventStream } from "./docker-events"
+import { getEventStream, getDnsName, getAppName, isIxAppContainer, prohibitedNetworkMode, listApps } from "./docker"
 import { logger } from "./logger"
-import { NPMServer } from "./nginx-proxy";
+import { NPMServer } from "./npm";
 
 // Comma-separated list in env, e.g. "adguard,radarr"
 const BLACKLIST = (process.env.APP_BLACKLIST || "")
@@ -68,44 +68,32 @@ function stopTokenRefresh(): void {
   }
 }
 
-function getDnsName(container: Docker.ContainerInfo) {
-  const service = container.Labels["com.docker.compose.service"]
-  const project = container.Labels["com.docker.compose.project"]
-  return `${service}.${project}.svc.cluster.local`
-}
+async function proxyApp(docker: Docker, appName: string) {
+  // Get all containers for this app
+  const appContainers = await docker.listContainers({
+    limit: -1,
+    filters: {
+      label: [ "com.docker.compose.project" ]
+    }
+  }).filter(container => {
+    if (!isIxAppContainer(container)) return false;
+    if (getAppName(container) !== appName) return false;
+    if (prohibitedNetworkMode(container)) {
+      logger.debug(`Container ${container.Id} is using network mode ${container.HostConfig.NetworkMode}, skipping`);
+      return false;
+    }
+    return true;
+  });
 
-function getAppName(container: Docker.ContainerInfo) {
-  const label = container.Labels["com.docker.compose.project"]; // e.g. "ix-radarr"
-  const name = label.replace(/^ix-/, ""); // → "radarr"
-  return name;
-}
-
-function isIxAppContainer(container: Docker.ContainerInfo) {
-  return container.Labels["com.docker.compose.project"].startsWith("ix-")
-}
-
-function prohibitedNetworkMode(networkMode: string) {
-  return [ "none", "host" ].includes(networkMode) ||
-    networkMode.startsWith("container:") ||
-    networkMode.startsWith("service:")
-}
-
-async function connectContainerToAppsNetwork(docker: Docker, container: Docker.ContainerInfo) {
-  if (!isIxAppContainer(container)) {
-    logger.debug(`Container ${container.Id} is not from ix app, skipping`);
-  }
-
-  if (prohibitedNetworkMode(container.HostConfig.NetworkMode)) {
-    logger.debug(`Container ${container.Id} is using network mode ${container.HostConfig.NetworkMode}, skipping`);
-    return
-  }
-
-  const dnsName = getDnsName(container);
-  const appName = getAppName(container);
-  if (BLACKLIST.includes(appName)) {
-    logger.debug(`Application ${appName} is blacklisted, skipping`);
+  if (appContainers.length === 0) {
+    logger.debug(`No valid containers found for app ${appName}`);
     return;
   }
+
+  // Pick the first valid container
+  const selectedContainer = appContainers[0];
+  const dnsName = getDnsName(selectedContainer);
+  logger.debug(`App ${appName} has ${appContainers.length} valid containers, proxfing: ${selectedContainer.Id}`);
 
   try {
     await npmServer.createProxyHost({
@@ -115,76 +103,66 @@ async function connectContainerToAppsNetwork(docker: Docker, container: Docker.C
       port: 80,
       certificateId: Number(process.env.NPM_CERT_ID) || 0
     });
+
+    logger.info(`Application ${appName} proxied via container ${selectedContainer.Id} (${selectedContainer.Names.join(", ")}) -> ${dnsName}`);
   } catch (error) {
     logger.error(`Failed to create proxy host for ${appName}:`, error);
     return;
   }
-
-  logger.info(`Container ${container.Id} (aka ${container.Names.join(", ")}) proxy ${dnsName}`)
-}
-
-function isIxProjectName(name: string) {
-  return name.startsWith("ix-")
-}
-
-async function connectAllContainersToAppsNetwork(docker: Docker) {
-  logger.debug("Connecting existing app containers to network")
-  const containers = await docker.listContainers({
-    limit: -1,
-    filters: {
-      label: [ "com.docker.compose.project" ]
-    }
-  })
-
-  // const appContainers = containers.filter(isIxAppContainer)
-  for (const container of containers) {
-    // if (isContainerInNetwork(container)) {
-    //   logger.debug(`Container ${container.Id} already connected to network`)
-    //   continue
-    // }
-
-    await connectContainerToAppsNetwork(docker, container)
-  }
-
-  logger.info("All existing app containers connected to network")
-}
-
-async function connectNewContainerToAppsNetwork(docker: Docker, containerId: string) {
-  const [ container ] = await docker.listContainers({
-    filters: {
-      id: [ containerId ]
-    }
-  })
-
-  if (!container) {
-    logger.warn(`Container ${containerId} not found`)
-    return
-  }
-
-  logger.debug(`New container started: ${container.Id}`)
-  await connectContainerToAppsNetwork(docker, container)
 }
 
 async function main() {
   try {
-    // Initialize NPM server first
+    // Initialize
     await initializeNPMServer();
-    
-    // Start periodic token refresh
-    startTokenRefresh();
-    
     const docker = new Docker()
+    startTokenRefresh();
 
-    await connectAllContainersToAppsNetwork(docker)
+    // Proxy existing applications
+    logger.debug("Proxying existing applications")
+    for (const appName of await listApps(docker)) {
+      if (BLACKLIST.includes(appName)) {
+        logger.debug(`Application ${appName} is blacklisted, skipping`);
+        continue;
+      }
 
-    const events = getEventStream(docker)
-    events.on("container.start", (event) => {
-      // const containerAttributes = event.Actor.Attributes
-      // if (!isIxProjectName(containerAttributes["com.docker.compose.project"])) {
-        // return
-      // }
+      logger.info(`Proxying application ${appName}`);
+      await proxyApp(docker, appName);
+    }
+    
+    // Proxy new applications
+    getEventStream(docker).on("container.start", async (event) => {
+      const [ container ] = await docker.listContainers({
+        filters: {
+          id: [ event.Actor["ID"] ]
+        }
+      })
 
-      connectNewContainerToAppsNetwork(docker, event.Actor["ID"])
+      if (!container) {
+        logger.warn(`Container ${event.Actor["ID"]} not found`)
+        return
+      }
+
+      if (!isIxAppContainer(container)) {
+        logger.debug(`Container ${container.Id} is not from ix app, skipping`)
+        return
+      }
+
+      const appName = getAppName(container);
+      logger.debug(`New container started for app ${appName}: ${container.Id}`)
+      
+      if (BLACKLIST.includes(appName)) {
+        logger.debug(`Application ${appName} is blacklisted, skipping`);
+        return;
+      }
+
+      logger.info(`Proxying application ${appName}`);
+      
+      // Wait a bit for all containers of the app to start
+      logger.debug(`Waiting 5 seconds for all containers of app ${appName} to start`);
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      
+      await proxyApp(docker, appName)
     })
     
     // Graceful shutdown handling
