@@ -1,86 +1,277 @@
 import { logger } from "./logger"
 import axios from "axios";
 
+// Custom exception classes
+export class NPMAuthenticationError extends Error {
+  constructor(message: string, public statusCode?: number) {
+    super(message);
+    this.name = 'NPMAuthenticationError';
+  }
+}
+
+export class NPMTokenError extends Error {
+  constructor(message: string, public statusCode?: number) {
+    super(message);
+    this.name = 'NPMTokenError';
+  }
+}
+
+export class NPMProxyHostError extends Error {
+  constructor(message: string, public statusCode?: number) {
+    super(message);
+    this.name = 'NPMProxyHostError';
+  }
+}
+
+export class NPMNetworkError extends Error {
+  constructor(message: string, public originalError?: unknown) {
+    super(message);
+    this.name = 'NPMNetworkError';
+  }
+}
 
 interface ProxyHostOptions {
-  npmUrl: string;
   domainName: string;
   scheme: string;
   forwardHost: string;
   port: number;
   certificateId: number;
-  apiKey: string;
+}
+
+interface TokenResponse {
+  expires: string;
+  token: string;
+}
+
+interface TokenData {
+  token: string;
+  expires: Date;
+}
+
+interface NPMServerCredentials {
+  identity: string;
+  secret: string;
+}
+
+interface NPMServerToken {
+  token: string;
 }
 
 
-export async function createProxyHost({
-    npmUrl,
-    domainName,
-    scheme,
-    forwardHost,
-    port,
-    certificateId,
-    apiKey
-}: ProxyHostOptions) {
-  const url = `${npmUrl}/api/nginx/proxy-hosts`;
+export class NPMServer {
+  private npmUrl: string;
+  private tokenData: TokenData | null = null;
+  private credentials: NPMServerCredentials | null = null;
 
-  const data = {
-    domain_names: [`${domainName}`],
-    forward_scheme: scheme,
-    forward_host: forwardHost,
-    forward_port: port,
-    certificate_id: certificateId,
-    block_exploits: "true",
-    caching_enabled: "true",
-    http2_support: "true",
-    enabled: "true"
-  };
-
-  const statusCodeExplanations: Record<number, string> = {
-    200: "OK: The request was successful.",
-    201: "Created: The request was successful and a resource was created.",
-    400: "Bad Request: The request was invalid or cannot be otherwise served - this may mean the proxy host already exists, or some config error.",
-    401: "Unauthorized: Authentication is required and has failed or has not yet been provided.",
-    403: "Forbidden: The request was valid, but the server is refusing action.",
-    404: "Not Found: The requested resource could not be found.",
-    405: "Method Not Allowed: A request method is not supported for the requested resource.",
-    408: "Request Timeout: The server timed out waiting for the request.",
-    500: "Internal Server Error: An error has occurred in the server.",
-    502: "Bad Gateway: The server was acting as a gateway or proxy and received an invalid response from the upstream server.",
-    503: "Service Unavailable: The server is not ready to handle the request.",
-    504: "Gateway Timeout: The server was acting as a gateway or proxy and did not receive a timely response from the upstream server."
-  };
-
-  try {
-    logger.info(`Sending requrest ${JSON.stringify(data, null, 2)} to ${url}`);
-    const response = await axios.post(url, data, {
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json"
-      }
-    });
-
-    if (statusCodeExplanations[response.status]) {
-      logger.debug(`HTTP ${response.status}: ${statusCodeExplanations[response.status]}`);
-      if ([200, 201].includes(response.status)) {
-        logger.info(`Proxy host for ${domainName} created successfully`);
-      } else {
-        logger.error(
-          `Error creating proxy host for ${domainName}. Returned status code: ${response.status}.`
-        );
-      }
-    } else {
-      logger.error(`Received unexpected status code: ${response.status}`);
+  constructor(npmUrl: string, auth: NPMServerCredentials | NPMServerToken) {
+    this.npmUrl = npmUrl;
+    
+    if ('identity' in auth && 'secret' in auth) {
+      this.credentials = auth;
+    } else if ('token' in auth) {
+      // For existing token, set it temporarily - refresh will update with expiration
+      this.tokenData = { token: auth.token, expires: new Date(0) };
     }
-  } catch (error: unknown) {
-    if (axios.isAxiosError(error) && error.response) {
-      console.error(
-        `Axios - HTTP ${error.response.status}: ${statusCodeExplanations[error.response.status] || "Unknown error"}`
-      );
-    } else if (error instanceof Error) {
-      console.error("Error:", error.message);
-    } else {
-      console.error("Unexpected error", error);
+  }
+
+  // Static factory method for async initialization
+  static async create(npmUrl: string, auth: NPMServerCredentials | NPMServerToken): Promise<NPMServer> {
+    const server = new NPMServer(npmUrl, auth);
+    await server.refreshToken();
+    return server;
+  }
+
+  private async createToken(): Promise<TokenResponse> {
+    if (!this.credentials) {
+      throw new NPMTokenError("No credentials available to create token");
+    }
+    
+    const url = `${this.npmUrl}/api/tokens`;
+    const data = {
+      identity: this.credentials.identity,
+      secret: this.credentials.secret
+    };
+
+    try {
+      logger.info(`Sending token request for identity: ${this.credentials.identity} to ${url}`);
+      const response = await axios.post<TokenResponse>(url, data, {
+        headers: {
+          "Content-Type": "application/json"
+        }
+      });
+
+      if ([200, 201].includes(response.status)) {
+        logger.info(`Token created successfully for identity: ${this.credentials.identity}`);
+        return response.data;
+      } else {
+        const errorMessage = `Failed to create token for identity: ${this.credentials.identity}. Status: ${response.status}`;
+        logger.error(errorMessage);
+        throw new NPMTokenError(errorMessage, response.status);
+      }
+    } catch (error: unknown) {
+      if (axios.isAxiosError(error)) {
+        if (error.response) {
+          const errorMessage = `Token creation failed with status ${error.response.status}`;
+          logger.error(errorMessage);
+          throw new NPMTokenError(errorMessage, error.response.status);
+        } else if (error.request) {
+          const errorMessage = "Network error during token creation - no response received";
+          logger.error(errorMessage);
+          throw new NPMNetworkError(errorMessage, error);
+        }
+      }
+      
+      const errorMessage = error instanceof Error ? error.message : "Unknown error during token creation";
+      logger.error(errorMessage);
+      throw new NPMTokenError(errorMessage);
+    }
+  }
+
+  private isTokenValid(): boolean {
+    if (!this.tokenData) return false;
+    const now = new Date();
+    const bufferTime = 5 * 60 * 1000; // 5 minutes buffer
+    return this.tokenData.expires.getTime() > (now.getTime() + bufferTime);
+  }
+
+  private async ensureValidToken(): Promise<void> {
+    if (!this.isTokenValid()) {
+      logger.info("Token is expired or will expire soon, refreshing...");
+      await this.refreshToken();
+    }
+  }
+
+  public async refreshToken(): Promise<TokenResponse> {
+    // First try to refresh existing token if available
+    if (this.tokenData?.token) {
+      try {
+        return await this.refreshExistingToken();
+      } catch (error) {
+        logger.warn("Token refresh failed, will try to create new token with credentials");
+        // Continue to fallback below
+      }
+    }
+
+    // If no token or refresh failed, try to create new token with credentials
+    if (this.credentials) {
+      const tokenResponse = await this.createToken();
+      this.tokenData = {
+        token: tokenResponse.token,
+        expires: new Date(tokenResponse.expires)
+      };
+      return tokenResponse;
+    }
+
+    throw new NPMTokenError("No token available and no credentials to create new token");
+  }
+
+  private async refreshExistingToken(): Promise<TokenResponse> {
+    if (!this.tokenData?.token) {
+      throw new NPMTokenError("No existing token to refresh");
+    }
+
+    const url = `${this.npmUrl}/api/tokens`;
+
+    try {
+      logger.info(`Refreshing existing token at ${url}`);
+      const response = await axios.get<TokenResponse>(url, {
+        headers: {
+          Authorization: `Bearer ${this.tokenData.token}`,
+          "Content-Type": "application/json"
+        }
+      });
+
+      if ([200, 201].includes(response.status)) {
+        logger.info(`Token refreshed successfully`);
+        this.tokenData = {
+          token: response.data.token,
+          expires: new Date(response.data.expires)
+        };
+        return response.data;
+      } else {
+        const errorMessage = `Token refresh failed with status ${response.status}`;
+        logger.error(errorMessage);
+        throw new NPMTokenError(errorMessage, response.status);
+      }
+    } catch (error: unknown) {
+      if (axios.isAxiosError(error)) {
+        if (error.response) {
+          const errorMessage = `Token refresh failed with status ${error.response.status}`;
+          logger.error(errorMessage);
+          throw new NPMTokenError(errorMessage, error.response.status);
+        } else if (error.request) {
+          const errorMessage = "Network error during token refresh - no response received";
+          logger.error(errorMessage);
+          throw new NPMNetworkError(errorMessage, error);
+        }
+      }
+      
+      const errorMessage = error instanceof Error ? error.message : "Unknown error during token refresh";
+      logger.error(errorMessage);
+      throw new NPMTokenError(errorMessage);
+    }
+  }
+
+  public async createProxyHost(options: ProxyHostOptions): Promise<void> {
+    // Ensure we have a valid token before making the request
+    await this.ensureValidToken();
+
+    const url = `${this.npmUrl}/api/nginx/proxy-hosts`;
+    const data = {
+      domain_names: [`${options.domainName}`],
+      forward_scheme: options.scheme,
+      forward_host: options.forwardHost,
+      forward_port: options.port,
+      certificate_id: options.certificateId,
+      block_exploits: "true",
+      caching_enabled: "true",
+      http2_support: "true",
+      enabled: "true"
+    };
+
+    try {
+      logger.info(`Sending request ${JSON.stringify(data, null, 2)} to ${url}`);
+      const response = await axios.post(url, data, {
+        headers: {
+          Authorization: `Bearer ${this.tokenData!.token}`,
+          "Content-Type": "application/json"
+        }
+      });
+
+      if ([200, 201].includes(response.status)) {
+        logger.info(`Proxy host for ${options.domainName} created successfully`);
+        return;
+      } else if (response.status === 400) {
+        // 400 might mean the proxy host already exists
+        logger.warn(`Proxy host for ${options.domainName} may already exist (status 400)`);
+        return;
+      } else {
+        const errorMessage = `Failed to create proxy host for ${options.domainName}. Status: ${response.status}`;
+        logger.error(errorMessage);
+        throw new NPMProxyHostError(errorMessage, response.status);
+      }
+    } catch (error: unknown) {
+      if (axios.isAxiosError(error)) {
+        if (error.response) {
+          if (error.response.status === 400) {
+            // 400 might mean the proxy host already exists
+            logger.warn(`Proxy host for ${options.domainName} may already exist (status 400)`);
+            return;
+          } else {
+            const errorMessage = `Proxy host creation failed with status ${error.response.status}`;
+            logger.error(errorMessage);
+            throw new NPMProxyHostError(errorMessage, error.response.status);
+          }
+        } else if (error.request) {
+          const errorMessage = "Network error during proxy host creation - no response received";
+          logger.error(errorMessage);
+          throw new NPMNetworkError(errorMessage, error);
+        }
+      }
+      
+      const errorMessage = error instanceof Error ? error.message : "Unknown error during proxy host creation";
+      logger.error(errorMessage);
+      throw new NPMProxyHostError(errorMessage);
     }
   }
 }
