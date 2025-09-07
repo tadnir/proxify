@@ -68,69 +68,123 @@ function stopTokenRefresh(): void {
   }
 }
 
+async function selectAppContainer(docker: Docker, appName: string) {
+    // Get all containers for this app
+    let appContainers = await docker.listContainers({
+      limit: -1,
+      filters: {
+        label: [ "com.docker.compose.project" ]
+      }
+    })
+    appContainers = appContainers.filter(container => {
+      if (!isIxAppContainer(container)) return false;
+      if (getAppName(container) !== appName) return false;
+      if (prohibitedNetworkMode(container)) {
+        logger.debug(`Container ${container.Id} is using network mode ${container.HostConfig.NetworkMode}, skipping`);
+        return false;
+      }
+      return true;
+    });
+  
+    if (appContainers.length === 0) {
+      logger.debug(`No valid containers found for app ${appName}`);
+      return;
+    }
+  
+    // Filter containers with open ports
+    const containersWithPorts = appContainers.filter(container => {
+      const openPorts = getOpenPorts(container);
+      return openPorts.length > 0;
+    });
+  
+    if (containersWithPorts.length === 0) {
+      logger.debug(`No containers with open ports found for app ${appName}`);
+      return;
+    }
+  
+    // Select container based on port priority: 443 (HTTPS) > 80 (HTTP) > first available
+    let selectedContainer: Docker.ContainerInfo;
+    let scheme: string;
+    let port: number;
+  
+    const httpsContainer = containersWithPorts.find(container => hasOpenPort(container, 443));
+    const httpContainer = containersWithPorts.find(container => hasOpenPort(container, 80));
+  
+    if (httpsContainer) {
+      selectedContainer = httpsContainer;
+      scheme = "https";
+      port = 443;
+      logger.debug(`App ${appName}: Using HTTPS container ${selectedContainer.Id} with port 443`);
+    } else if (httpContainer) {
+      selectedContainer = httpContainer;
+      scheme = "http";
+      port = 80;
+      logger.debug(`App ${appName}: Using HTTP container ${selectedContainer.Id} with port 80`);
+    } else {
+      selectedContainer = containersWithPorts[0];
+      scheme = "http";
+      port = getOpenPorts(selectedContainer)[0];
+      logger.debug(`App ${appName}: Using first available container ${selectedContainer.Id} with port ${port}`);
+    }
+
+    logger.debug(`App ${appName} has ${containersWithPorts.length} containers with open ports, choosing: ${selectedContainer.Id}`);
+    return {
+      container: selectedContainer,
+      port: port,
+      scheme: scheme
+    }
+}
+
 async function proxyApp(docker: Docker, appName: string) {
-  // Get all containers for this app
-  let appContainers = await docker.listContainers({
-    limit: -1,
-    filters: {
-      label: [ "com.docker.compose.project" ]
-    }
-  })
-  appContainers = appContainers.filter(container => {
-    if (!isIxAppContainer(container)) return false;
-    if (getAppName(container) !== appName) return false;
-    if (prohibitedNetworkMode(container)) {
-      logger.debug(`Container ${container.Id} is using network mode ${container.HostConfig.NetworkMode}, skipping`);
-      return false;
-    }
-    return true;
-  });
-
-  if (appContainers.length === 0) {
-    logger.debug(`No valid containers found for app ${appName}`);
-    return;
-  }
-
-  // Filter containers with open ports
-  const containersWithPorts = appContainers.filter(container => {
-    const openPorts = getOpenPorts(container);
-    return openPorts.length > 0;
-  });
-
-  if (containersWithPorts.length === 0) {
-    logger.debug(`No containers with open ports found for app ${appName}`);
-    return;
-  }
-
-  // Select container based on port priority: 443 (HTTPS) > 80 (HTTP) > first available
-  let selectedContainer: Docker.ContainerInfo;
-  let scheme: string;
-  let port: number;
-
-  const httpsContainer = containersWithPorts.find(container => hasOpenPort(container, 443));
-  const httpContainer = containersWithPorts.find(container => hasOpenPort(container, 80));
-
-  if (httpsContainer) {
-    selectedContainer = httpsContainer;
-    scheme = "https";
-    port = 443;
-    logger.debug(`App ${appName}: Using HTTPS container ${selectedContainer.Id} with port 443`);
-  } else if (httpContainer) {
-    selectedContainer = httpContainer;
-    scheme = "http";
-    port = 80;
-    logger.debug(`App ${appName}: Using HTTP container ${selectedContainer.Id} with port 80`);
-  } else {
-    selectedContainer = containersWithPorts[0];
-    scheme = "http";
-    port = getOpenPorts(selectedContainer)[0];
-    logger.debug(`App ${appName}: Using first available container ${selectedContainer.Id} with port ${port}`);
-  }
-
-  const dnsName = getDnsName(selectedContainer);
-  logger.debug(`App ${appName} has ${containersWithPorts.length} containers with open ports, proxying: ${selectedContainer.Id}`);
-
   try {
+    let container: Docker.ContainerInfo;
+    let port: number;
+    let scheme: string;
+    const appOverride = process.env[`APP_OVERRIDE_${appName.toUpperCase()}`];
+    if (appOverride) {
+      logger.info(`Found override for app ${appName}: ${appOverride}`);
+      const [containerName, portStr] = appOverride.split(':');
+      port = parseInt(portStr, 10);
+      if (!containerName || isNaN(port)) {
+        throw new Error(`Invalid override format for ${appName}, expected '<container-name>:<port>'`);
+      }
+
+      // Get all containers for this app
+      let appContainers = await docker.listContainers({
+        limit: -1,
+        filters: {
+          label: [ "com.docker.compose.project" ]
+        }
+      })
+      let matches = appContainers.filter(container => {
+        if (!isIxAppContainer(container)) return false;
+        if (getAppName(container) !== appName) return false;
+        if (prohibitedNetworkMode(container)) {
+          logger.debug(`Container ${container.Id} is using network mode ${container.HostConfig.NetworkMode}, skipping`);
+          return false;
+        }
+        return container.Names.some(n => n.replace(/^\//, "").replace(/-\d+$/, "") === `ix-${appName}-${containerName}`);
+      });
+      if (matches.length != 1) {
+        throw new Error(`Found invalid amount of containers (${matches.length}) matching override '${containerName}' of app '${appName}'`);
+      }
+
+      container = matches[0];
+      scheme = port === 443 ? "https" : "http";
+      logger.debug(`App ${appName}: Using OVERRIDE container ${container.Id} with port ${port} (${scheme})`);
+    } else {
+      const selectedInfo = await selectAppContainer(docker, appName);
+      if (!selectedInfo) {
+        // Cloudn't select app container, logs from inside the function.
+        return;
+      }
+
+      container = selectedInfo.container;
+      port = selectedInfo.port;
+      scheme = selectedInfo.scheme;
+    }
+
+    const dnsName = getDnsName(container);
     await npmServer.createProxyHost({
       domainName: `${appName}.${process.env.DOMAIN_NAME || "example.com"}`,
       scheme: scheme,
@@ -139,7 +193,7 @@ async function proxyApp(docker: Docker, appName: string) {
       certificateId: Number(process.env.NPM_CERT_ID) || 0
     });
 
-    logger.info(`Application ${appName} proxied via container ${selectedContainer.Id} (${selectedContainer.Names.join(", ")}) -> ${dnsName}`);
+    logger.info(`Application ${appName} proxied via container ${container.Id} (${container.Names.join(", ")}) -> ${dnsName}`);
   } catch (error) {
     logger.error(`Failed to create proxy host for ${appName}:`, error);
     return;

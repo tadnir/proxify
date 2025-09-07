@@ -18,16 +18,17 @@ services:
     image: ghcr.io/tadnir/proxify:main
     restart: always
     environment:
-      LOG_LEVEL: info # change to debug for more verbose logging
-      DOMAIN_NAME: example.com # apps will be available at <app-name>.example.com
-      NPM_APP_NAME: nginxproxy # change to the app name in TrueNas
-      NPM_APP_PORT: 81 # port for npm web ui
+      LOG_LEVEL: info # Change to debug for more verbose logging
+      DOMAIN_NAME: example.com # Apps will be available at <app-name>.example.com
+      NPM_APP_NAME: nginxproxy # Change to the app name in TrueNas
+      NPM_APP_PORT: 81 # Port for npm web ui
       NPM_MAIL: admin@example.com # NPM admin email/username
       NPM_PASSWORD: yourpassword # NPM admin password
       # OR use NPM_TOKEN: your-jwt-token # NPM JWT token (alternative to credentials)
       NPM_TOKEN_REFRESH_INTERVAL: 60 # Token refresh interval in minutes (0 to disable)
       NPM_CERT_ID: 1 # The Id of the certificate to set of the proxies (id can be seen in web ui)
       APP_BLACKLIST: "nginxproxy,dragonify,proxify" # List of apps that won't be configured to npm
+      # Optional: APP_OVERRIDE_<APP_NAME>: <container-name>:<port> # Override used container/port for proxy of given app
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
 ```
